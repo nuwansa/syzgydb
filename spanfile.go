@@ -121,9 +121,10 @@ func (db *SpanFile) Close() error {
 	defer db.fileMutex.Unlock()
 
 	if db.mmapData != nil {
-		err := msync(db.mmapData)
+		err := db.msyncData()
 		if err != nil {
-			return err
+			// Log or handle msync error before unmap?
+			// For now, proceed to unmap.
 		}
 		err = db.mmapData.Unmap()
 		if err != nil {
@@ -234,6 +235,12 @@ func OpenFile(filename string, mode FileMode) (*SpanFile, error) {
 		if err != nil {
 			file.Close()
 			return nil, err
+		}
+		// Ensure initial write is synced to disk
+		err = file.Sync()
+		if err != nil {
+			file.Close()
+			return nil, fmt.Errorf("failed to sync initial span write: %v", err)
 		}
 	}
 
@@ -392,6 +399,9 @@ func (db *SpanFile) RemoveRecord(recordID string) error {
 	// Remove the record from the index
 	delete(db.index, recordID)
 
+	if err := db.msyncData(); err != nil {
+		return fmt.Errorf("failed to sync after removing record %s: %v", recordID, err)
+	}
 	return nil
 }
 
@@ -471,6 +481,9 @@ func (db *SpanFile) WriteRecord(recordID string, dataStreams []DataStream) error
 
 	db.index[recordID] = offset
 
+	if err := db.msyncData(); err != nil {
+		return fmt.Errorf("failed to sync after writing record %s: %v", recordID, err)
+	}
 	return nil
 }
 
@@ -502,12 +515,18 @@ func (db *SpanFile) writeAt(data []byte, offset uint64) error {
 	}
 
 	copy(db.mmapData[offset:], data)
-	return msync(db.mmapData[offset : offset+uint64(len(data))])
+	// Flush the specific range that was written.
+	// Note: mmap.Flush() flushes the entire mapped region.
+	// If granular flushing is needed and available, it could be mmapData[offset : offset+uint64(len(data))].Flush()
+	// However, standard mmap.Flush() is usually sufficient.
+	return db.msyncData()
 }
 
 func (db *SpanFile) markSpanAsFreed(offset uint64) error {
 	binary.BigEndian.PutUint32(db.mmapData[offset:offset+4], freeMagic)
-	return msync(db.mmapData[offset : offset+4])
+	// Flush the change to the magic number.
+	// As above, mmap.Flush() flushes the entire region.
+	return db.msyncData()
 }
 
 func (db *SpanFile) ReadRecord(recordID string) (*Span, error) {
@@ -865,10 +884,12 @@ func (db *SpanFile) appendToFile(data []byte) error {
 	return nil
 }
 
-func msync(_ []byte) error {
-	// Implement msync logic
-	// This is a placeholder implementation
-	return nil
+// msyncData flushes changes in the memory-mapped file to disk.
+func (db *SpanFile) msyncData() error {
+	if db.mmapData == nil {
+		return nil // Or an error indicating the file is not mapped/closed
+	}
+	return db.mmapData.Flush()
 }
 
 func magicNumberToString(magic uint32) string {
